@@ -6,8 +6,8 @@
 //!
 //! - On a **struct**: emits `jsg::Type`, `jsg::ToJS`, `jsg::FromJS`,
 //!   `jsg::Traced`, and `jsg::GarbageCollected` implementations.
-//! - On an **impl block**: emits the `jsg::Resource` trait with method, static
-//!   method, static constant, and constructor registrations.
+//! - On an **impl block**: emits member factories and, unless `custom_members` is set,
+//!   the `jsg::Resource` trait with automatic member registration.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -136,9 +136,34 @@ pub fn generate_resource_struct(attr: TokenStream, input: &syn::DeriveInput) -> 
     .into()
 }
 
-/// Scans `impl_block` for `#[jsg_method]`-annotated functions and returns a
-/// `Member::Method` / `Member::StaticMethod` token stream for each.
-fn collect_method_registrations(impl_block: &ItemImpl) -> Vec<proc_macro2::TokenStream> {
+/// A generated member factory and its invocation for automatic registration.
+struct MemberRegistration {
+    factory: proc_macro2::TokenStream,
+    automatic: proc_macro2::TokenStream,
+}
+
+fn member_factory_name(rust_name: &syn::Ident) -> syn::Ident {
+    syn::Ident::new(&format!("{rust_name}_member"), rust_name.span())
+}
+
+impl MemberRegistration {
+    fn new(rust_name: &syn::Ident, member: &proc_macro2::TokenStream) -> Self {
+        let factory_name = member_factory_name(rust_name);
+        Self {
+            factory: quote! {
+                #[automatically_derived]
+                #[must_use]
+                fn #factory_name() -> jsg::Member {
+                    #member
+                }
+            },
+            automatic: quote! { Self::#factory_name() },
+        }
+    }
+}
+
+/// Scans `impl_block` for `#[jsg_method]`-annotated functions.
+fn collect_method_registrations(impl_block: &ItemImpl) -> Vec<MemberRegistration> {
     impl_block
         .items
         .iter()
@@ -165,18 +190,18 @@ fn collect_method_registrations(impl_block: &ItemImpl) -> Vec<proc_macro2::Token
                 .iter()
                 .any(|arg| matches!(arg, FnArg::Receiver(_)));
 
-            Some(if has_self {
+            let member = if has_self {
                 quote! { jsg::Member::Method { name: #js_name.to_owned(), callback: Self::#callback_name() } }
             } else {
                 quote! { jsg::Member::StaticMethod { name: #js_name.to_owned(), callback: Self::#callback_name() } }
-            })
+            };
+            Some(MemberRegistration::new(rust_method_name, &member))
         })
         .collect()
 }
 
-/// Scans `impl_block` for `#[jsg_static_constant]`-annotated consts and returns
-/// a `Member::StaticConstant` token stream for each.
-fn collect_constant_registrations(impl_block: &ItemImpl) -> Vec<proc_macro2::TokenStream> {
+/// Scans `impl_block` for `#[jsg_static_constant]`-annotated consts.
+fn collect_constant_registrations(impl_block: &ItemImpl) -> Vec<MemberRegistration> {
     impl_block
         .items
         .iter()
@@ -198,18 +223,55 @@ fn collect_constant_registrations(impl_block: &ItemImpl) -> Vec<proc_macro2::Tok
                 .and_then(extract_name_attribute)
                 .unwrap_or_else(|| rust_name.to_string());
 
-            Some(quote! {
-                jsg::Member::StaticConstant {
-                    name: #js_name.to_owned(),
-                    value: jsg::ConstantValue::from(Self::#rust_name),
-                }
-            })
+            let factory_base =
+                syn::Ident::new(&rust_name.to_string().to_lowercase(), rust_name.span());
+            Some(MemberRegistration::new(
+                &factory_base,
+                &quote! {
+                    jsg::Member::StaticConstant {
+                        name: #js_name.to_owned(),
+                        value: jsg::ConstantValue::from(Self::#rust_name),
+                    }
+                },
+            ))
         })
         .collect()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistrationMode {
+    Automatic,
+    Custom,
+}
+
+fn parse_registration_mode(attr: proc_macro2::TokenStream) -> syn::Result<RegistrationMode> {
+    use syn::parse::Parser as _;
+
+    let args =
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated.parse2(attr)?;
+    let mut mode = RegistrationMode::Automatic;
+    for arg in args {
+        if matches!(&arg, syn::Meta::Path(path) if path.is_ident("custom_members")) {
+            if mode == RegistrationMode::Custom {
+                return Err(syn::Error::new_spanned(arg, "duplicate `custom_members`"));
+            }
+            mode = RegistrationMode::Custom;
+        } else {
+            return Err(syn::Error::new_spanned(
+                arg,
+                "expected `custom_members` on a #[jsg_resource] impl block",
+            ));
+        }
+    }
+    Ok(mode)
+}
+
 /// Entry point called from `lib.rs` for `#[jsg_resource]` on an impl block.
-pub fn generate_resource_impl(impl_block: &ItemImpl) -> TokenStream {
+pub fn generate_resource_impl(attr: TokenStream, impl_block: &ItemImpl) -> TokenStream {
+    let mode = match parse_registration_mode(attr.into()) {
+        Ok(mode) => mode,
+        Err(err) => return err.to_compile_error().into(),
+    };
     let self_ty = &impl_block.self_ty;
 
     if !matches!(&**self_ty, syn::Type::Path(_)) {
@@ -219,30 +281,46 @@ pub fn generate_resource_impl(impl_block: &ItemImpl) -> TokenStream {
         );
     }
 
-    let method_registrations = collect_method_registrations(impl_block);
-    let property_registrations = collect_property_registrations(impl_block);
-    let constant_registrations = collect_constant_registrations(impl_block);
+    let mut registrations = match generate_constructor_registration(impl_block, self_ty) {
+        Ok(constructor) => constructor.into_iter().collect::<Vec<_>>(),
+        Err(err) => return err.into(),
+    };
+    registrations.extend(collect_method_registrations(impl_block));
+    match collect_property_registrations(impl_block) {
+        Ok(properties) => registrations.extend(properties),
+        Err(err) => return err.into(),
+    }
+    registrations.extend(collect_constant_registrations(impl_block));
+    let factories = registrations.iter().map(|r| &r.factory);
+    let automatic = registrations.iter().map(|r| &r.automatic);
 
-    let constructor_registration = generate_constructor_registration(impl_block, self_ty);
-    let constructor_vec: Vec<_> = constructor_registration.into_iter().collect();
+    let resource_impl = if mode == RegistrationMode::Automatic {
+        quote! {
+            #[automatically_derived]
+            impl jsg::Resource for #self_ty {
+                fn members(
+                    _flags: jsg::feature_flags::compatibility_flags::Reader<'_>,
+                ) -> Vec<jsg::Member>
+                where
+                    Self: Sized,
+                {
+                    vec![#(#automatic,)*]
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     quote! {
         #impl_block
 
         #[automatically_derived]
-        impl jsg::Resource for #self_ty {
-            fn members() -> Vec<jsg::Member>
-            where
-                Self: Sized,
-            {
-                vec![
-                    #(#constructor_vec,)*
-                    #(#method_registrations,)*
-                    #(#property_registrations,)*
-                    #(#constant_registrations,)*
-                ]
-            }
+        impl #self_ty {
+            #(#factories)*
         }
+
+        #resource_impl
     }
     .into()
 }
@@ -330,13 +408,12 @@ fn extract_constructor_params(
 }
 
 /// Scans an impl block for a `#[jsg_constructor]` attribute and generates the
-/// constructor callback registration. Returns `None` if no constructor is defined.
-/// Validates that a `#[jsg_constructor]` method has the right shape and returns
-/// a compile-error token stream if it doesn't.
+/// constructor member factory. Returns `None` if no constructor is defined.
+/// Validates that a `#[jsg_constructor]` method has the right shape.
 fn generate_constructor_registration(
     impl_block: &ItemImpl,
     self_ty: &syn::Type,
-) -> Option<proc_macro2::TokenStream> {
+) -> Result<Option<MemberRegistration>, proc_macro2::TokenStream> {
     let constructors: Vec<_> = impl_block
         .items
         .iter()
@@ -349,66 +426,64 @@ fn generate_constructor_registration(
         .collect();
 
     if constructors.len() > 1 {
-        return Some(quote! {
+        return Err(quote! {
             compile_error!("only one #[jsg_constructor] is allowed per impl block");
         });
     }
 
-    constructors
-        .into_iter()
-        .map(|method| {
-            if let Some(err) = validate_constructor(method) {
-                return err;
-            }
+    let Some(method) = constructors.first() else {
+        return Ok(None);
+    };
+    if let Some(err) = validate_constructor(method) {
+        return Err(err);
+    }
 
-            let rust_method_name = &method.sig.ident;
+    let rust_method_name = &method.sig.ident;
 
-            let (has_lock_param, unwraps, arg_exprs) = extract_constructor_params(method);
-            let lock_arg = if has_lock_param {
-                quote! { &mut *lock, }
-            } else {
-                quote! {}
-            };
+    let (has_lock_param, unwraps, arg_exprs) = extract_constructor_params(method);
+    let lock_arg = if has_lock_param {
+        quote! { &mut *lock, }
+    } else {
+        quote! {}
+    };
 
-            quote! {
-                jsg::Member::Constructor {
-                    callback: jsg::function_callback(|lock, args| {
-                        // Without `new`, `this` is an arbitrary receiver with no
-                        // internal fields to attach the resource to. The message
-                        // matches C++ `throwIfConstructorCalledAsFunction`.
-                        if !args.is_construct_call() {
-                            lock.throw_exception(&jsg::Error::new_type_error(format!(
-                                "Failed to construct '{}': Please use the 'new' operator, \
-                                 this object constructor cannot be called as a function.",
-                                <#self_ty as jsg::Type>::class_name(),
-                            )));
-                            return;
-                        }
-
-                        #(#unwraps)*
-
-                        let resource = #self_ty::#rust_method_name(#lock_arg #(#arg_exprs),*);
-                        let rc = jsg::Rc::new(resource);
-                        rc.attach_to_this(args);
-                    }),
+    let member = quote! {
+        jsg::Member::Constructor {
+            callback: jsg::function_callback(|lock, args| {
+                // Without `new`, `this` is an arbitrary receiver with no
+                // internal fields to attach the resource to. The message
+                // matches C++ `throwIfConstructorCalledAsFunction`.
+                if !args.is_construct_call() {
+                    lock.throw_exception(&jsg::Error::new_type_error(format!(
+                        "Failed to construct '{}': Please use the 'new' operator, \
+                         this object constructor cannot be called as a function.",
+                        <#self_ty as jsg::Type>::class_name(),
+                    )));
+                    return;
                 }
-            }
-        })
-        .next()
+
+                #(#unwraps)*
+
+                let resource = #self_ty::#rust_method_name(#lock_arg #(#arg_exprs),*);
+                let rc = jsg::Rc::new(resource);
+                rc.attach_to_this(args);
+            }),
+        }
+    };
+    Ok(Some(MemberRegistration::new(rust_method_name, &member)))
 }
 
 // ---------------------------------------------------------------------------
 // Property helpers
 // ---------------------------------------------------------------------------
 
-/// Emits one `Member::Property { .. }` token stream for a single property group,
-/// or an `Err` compile-error stream if the group has no getter.
+/// Emits a member factory for a property group, or an error if the group has no getter.
 fn emit_property_group(
     js_name: &str,
     kind: PropertyKind,
     getter: Option<syn::Ident>,
     setter: Option<syn::Ident>,
-) -> Result<proc_macro2::TokenStream, proc_macro2::TokenStream> {
+) -> Result<MemberRegistration, proc_macro2::TokenStream> {
     let Some(getter_name) = getter else {
         return Err(quote! {
             compile_error!(concat!("no getter found for property \"", #js_name, "\""))
@@ -416,45 +491,79 @@ fn emit_property_group(
     };
 
     let getter_cb = syn::Ident::new(&format!("{getter_name}_callback"), getter_name.span());
-    let kind_tokens = match kind {
-        PropertyKind::Prototype => quote! { jsg::PropertyKind::Prototype },
-        PropertyKind::Instance => quote! { jsg::PropertyKind::Instance },
-        PropertyKind::Inspect => quote! { jsg::PropertyKind::Inspect },
-    };
-    let setter_tokens = if let Some(setter_name) = setter {
+    let setter_tokens = if let Some(setter_name) = &setter {
         let setter_cb = syn::Ident::new(&format!("{setter_name}_callback"), setter_name.span());
         quote! { Some(Self::#setter_cb()) }
     } else {
         quote! { None }
     };
 
-    if kind == PropertyKind::Instance {
-        return Ok(quote! {
-            jsg::Member::InstanceProperty {
-                name: #js_name.to_owned(),
-                getter_callback: Self::#getter_cb(),
-                setter_callback: #setter_tokens,
-            }
-        });
-    }
-    Ok(quote! {
+    let kind_tokens = if kind == PropertyKind::Inspect {
+        quote! { jsg::PropertyKind::Inspect }
+    } else {
+        quote! { jsg::PropertyKind::Prototype }
+    };
+    let prototype_member = quote! {
         jsg::Member::Property {
             name: #js_name.to_owned(),
             kind: #kind_tokens,
             getter_callback: Self::#getter_cb(),
             setter_callback: #setter_tokens,
         }
+    };
+    if kind == PropertyKind::Inspect {
+        return Ok(MemberRegistration::new(&getter_name, &prototype_member));
+    }
+
+    let instance_getter_cb = syn::Ident::new(
+        &format!("{getter_name}_instance_callback"),
+        getter_name.span(),
+    );
+    let instance_setter = if let Some(setter_name) = setter {
+        let setter_cb = syn::Ident::new(
+            &format!("{setter_name}_instance_callback"),
+            setter_name.span(),
+        );
+        quote! { Some(Self::#setter_cb()) }
+    } else {
+        quote! { None }
+    };
+    let factory_name = member_factory_name(&getter_name);
+    let placement = if kind == PropertyKind::Instance {
+        quote! { jsg::PropertyPlacement::Instance }
+    } else {
+        quote! { jsg::PropertyPlacement::Prototype }
+    };
+    Ok(MemberRegistration {
+        factory: quote! {
+            #[automatically_derived]
+            #[must_use]
+            fn #factory_name(placement: jsg::PropertyPlacement) -> jsg::Member {
+                match placement {
+                    jsg::PropertyPlacement::Prototype => #prototype_member,
+                    jsg::PropertyPlacement::Instance => jsg::Member::InstanceProperty {
+                        name: #js_name.to_owned(),
+                        getter_callback: Self::#instance_getter_cb(),
+                        setter_callback: #instance_setter,
+                    },
+                }
+            }
+        },
+        automatic: quote! { Self::#factory_name(#placement) },
     })
 }
 
 /// Parses the argument list of `#[jsg_property([placement,] [name = "..."] [, readonly])]`.
 ///
-/// `placement` is optional; when omitted it defaults to `Prototype`.
+/// `placement` is `prototype` or `instance`; when omitted it defaults to `Prototype`.
 /// Returns `(PropertyKind, Option<js_name_override>, is_readonly)`.
 pub fn parse_jsg_property_args(
     tokens: TokenStream,
 ) -> Result<(PropertyKind, Option<String>, bool), proc_macro2::TokenStream> {
     use syn::parse::Parser as _;
+    const CONFLICTING_PLACEMENT: &str =
+        "conflicting placement: specify either `instance` or `prototype`, not both";
+
     let metas = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
         .parse(tokens)
         .map_err(|e| e.to_compile_error())?;
@@ -467,21 +576,17 @@ pub fn parse_jsg_property_args(
         match meta {
             syn::Meta::Path(p) if p.is_ident("instance") => {
                 if kind.is_some() {
-                    return Err(syn::Error::new_spanned(
-                        p,
-                        "conflicting placement: specify either `instance` or `prototype`, not both",
-                    )
-                    .to_compile_error());
+                    return Err(
+                        syn::Error::new_spanned(p, CONFLICTING_PLACEMENT).to_compile_error()
+                    );
                 }
                 kind = Some(PropertyKind::Instance);
             }
             syn::Meta::Path(p) if p.is_ident("prototype") => {
                 if kind.is_some() {
-                    return Err(syn::Error::new_spanned(
-                        p,
-                        "conflicting placement: specify either `instance` or `prototype`, not both",
-                    )
-                    .to_compile_error());
+                    return Err(
+                        syn::Error::new_spanned(p, CONFLICTING_PLACEMENT).to_compile_error()
+                    );
                 }
                 kind = Some(PropertyKind::Prototype);
             }
@@ -618,12 +723,12 @@ fn scan_property_annotations(
     Ok(groups)
 }
 
-/// Phase 2 (per group): validate constraints and emit one `Member::Property`.
+/// Phase 2 (per group): validate constraints and emit a member factory.
 fn validate_and_emit_property(
     js_name: &str,
     kind: PropertyKind,
     methods: Vec<PropMethod>,
-) -> Result<proc_macro2::TokenStream, proc_macro2::TokenStream> {
+) -> Result<MemberRegistration, proc_macro2::TokenStream> {
     let has_readonly_getter = methods.iter().any(|m| m.is_readonly && !m.is_setter);
     for m in &methods {
         if m.is_readonly && m.is_setter {
@@ -673,23 +778,14 @@ fn validate_and_emit_property(
 }
 
 /// Scans an impl block for `#[jsg_property]` and `#[jsg_inspect_property]` annotations
-/// and returns a `Member::Property` token stream for each property group.
-fn collect_property_registrations(impl_block: &ItemImpl) -> Vec<proc_macro2::TokenStream> {
-    let groups = match scan_property_annotations(impl_block) {
-        Ok(g) => g,
-        Err(e) => return vec![e],
-    };
-    let mut registrations = Vec::new();
-    for ((js_name, kind), methods) in groups {
-        match validate_and_emit_property(&js_name, kind, methods) {
-            Ok(ts) => registrations.push(ts),
-            Err(ts) => {
-                registrations.push(ts);
-                return registrations;
-            }
-        }
-    }
-    registrations
+/// and returns a member factory for each property group.
+fn collect_property_registrations(
+    impl_block: &ItemImpl,
+) -> Result<Vec<MemberRegistration>, proc_macro2::TokenStream> {
+    scan_property_annotations(impl_block)?
+        .into_iter()
+        .map(|((js_name, kind), methods)| validate_and_emit_property(&js_name, kind, methods))
+        .collect()
 }
 
 #[cfg(test)]
